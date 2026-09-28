@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# 运行期产物：审计日志与训练写出的 θ 变更不入库（可由训练重建）
+runs/*.jsonl
+
+# θ 是训练产物，但默认那份手写 base_prompt 要跟着仓库走
+assets/*.json
+
+.DS_Store
+.idea/
+.vscode/

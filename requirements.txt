@@ -1,0 +1,15 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+openai==1.58.1
+httpx==0.27.2
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# 注: 未引入 numpy —— GRPO 只需要均值与总体标准差，标准库 statistics 足够。
+# 未引入 python-dotenv。pydantic-settings 自身即读取 .env，
+# 两者共存会出现"改了 .env 不生效"的排查陷阱。
+# 未引入 torch/transformers/trl —— 本实现不做梯度更新，见 README。
+# 未引入 requests/beautifulsoup4/MCP SDK —— HTTP 走 httpx（openai 本就依赖它）；
+# Wolfram MCP 客户端只用得到 initialize / tools/call，手写 JSON-RPC 即可，
+# 也不再有爬虫与本地 BM25 索引（文档检索直接转发 MCP 的 WolframContext）。
+# 加依赖之前先问一句"真的需要吗"。
