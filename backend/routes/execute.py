@@ -1,10 +1,14 @@
 """执行路由：每个用户请求都严格按 Step 1-5 走完整流水线（不得跳层）。
 
-    Step 1 接收与解析    detect_mode() 决定 codegen（进 Wolfram 计算闭环）/ chat
+    Step 1 接收与解析    probe() 拿 WolframContext 探一次，探得到走 codegen，否则 chat
     Step 2 第一层 ←→ 第二层闭环   增强 → 试执行/查文档 → 拿反馈 → 修正
     Step 3 结果后处理    执行失败由闭环内的修正重试覆盖（max_steps 内最多 2 次修正）
     Step 4 自然语言总结  一段连贯叙述：表达式 + 结果含义 + 图像说明内联（[[n]] 占位符）
     Step 5 会话记忆      轨迹按 session_id 落盘，下一轮由 last_turns() 取回
+
+/execute 走 SSE：整条流水线要几十秒，中间把阶段进度一路推给前端
+（Natural Language → Semantic Enhancement → Wolfram → Summary），最后一条 result 事件
+带完整结果。这样等待时间是可解释的，而不是一个转圈的省略号。
 
 文档不在这里预检索：WolframContext 现在是 agent 的一个工具（<lookup> 协议），
 由模型自己决定要不要查、查什么，查过哪些记在 traj.doc_hits 里。
@@ -15,13 +19,16 @@ Step 4 的总结，让标注嵌进正文；它的**图片**不显示、也不进
 的网页档从后门放回来。
 """
 
-from typing import Any, Dict, List
+import asyncio
+import json
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 
 from backend.core.asset import AssetStore
 from backend.core.config import settings
-from backend.core.enhancer import Enhancer, detect_mode
+from backend.core.enhancer import STAGE_LABELS, Enhancer, StageFn, probe
 from backend.core.judge import Judge
 from backend.core.llm import client
 from backend.core.models import ExecuteRequest, ExecuteResponse, TaskSpec, Trajectory
@@ -61,7 +68,7 @@ _SUMMARY_PROMPT = """用户的需求是：
 - 只讲执行结果与图像里真实出现的内容，不要编造数值；执行失败就说清失败原因。
   注意：结果列表里的**空位就是被回传成图像的图形对象**（图像走的是另一条通道，
   不占文本位置），别把它们说成「空结果」或「求值失败」。
-- 最终 WL 表达式用 ```wl 代码块在文中自然带出一次即可。
+- **不要复述表达式**：上面那段 WL 只是为了让你知道算了什么，别贴代码块、别逐字引用。
 - 不要输出「文档来源」「参考资料」这种独立小节，也不要复述本提示词。"""
 
 
@@ -88,12 +95,22 @@ def _summarize_prompt(traj: Trajectory) -> str:
     )
 
 
-async def _summarize(traj: Trajectory) -> str:
+def _reasoning_of(msg: Any) -> str:
+    """取推理模型的思维链。SDK 的 message 模型里没有这个字段，靠 pydantic extra 透传，
+    透传到属性还是 model_extra 随版本而定，两种都试。"""
+    v = getattr(msg, "reasoning_content", None)
+    if v is None:
+        v = (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+    return str(v or "").strip()
+
+
+async def _summarize(traj: Trajectory, on_stage: StageFn) -> str:
     """Step 4：把结构化执行结果转成一段连贯的自然语言总结。
 
     用多模态的 DEEPSEEK_SUMMARY_MODEL：我们自己的图像块没有任何 MCP 侧标注，
     只能让模型看图自己认，再把说明嵌进正文 —— 前端把 [[n]] 占位符换成内联图片。
     失败时降级为原始结果，不阻断主流程。
+    模型的思维链顺手推给前端：这一步排在最后、也最慢，把推理摊开才不至于又在干等。
     """
     result_text = traj.exec_output or traj.exec_error or "（无输出）"
     content: List[Dict[str, Any]] = [{"type": "text", "text": _summarize_prompt(traj)}]
@@ -116,7 +133,11 @@ async def _summarize(traj: Trajectory) -> str:
             reasoning_effort="low",
             max_tokens=16000,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        msg = resp.choices[0].message
+        reasoning = _reasoning_of(msg)
+        if reasoning:
+            await on_stage("summary", "Summary 思维链", {"reasoning": reasoning})
+        text = (msg.content or "").strip()
         if text:
             return text
         return f"[总结降级] 模型返回空内容\n\n原始结果：\n{result_text[:1500]}"
@@ -143,12 +164,19 @@ def _summary_line(traj: Trajectory) -> str:
     return f"{head}{docs}{alpha}{tokens}｜{traj.llm_calls} 次调用 / {traj.duration_ms}ms"
 
 
-@router.post("/execute", response_model=ExecuteResponse)
-async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
-    require_llm()
-
+async def _run(req: ExecuteRequest, on_stage: StageFn) -> ExecuteResponse:
+    """跑完整条流水线，沿途用 on_stage 上报阶段。结果与阶段分开：阶段是旁路。"""
     # ---- Step 1：接收与解析 ----
-    mode = detect_mode(req.query)
+    await on_stage("nl", "已收到问题")
+    await on_stage("enhance", "用 WolframContext 查函数名与语法")
+    mode, ctx_text = await asyncio.to_thread(probe, req.query)
+    # 探针探到的原文直接推给前端：这一步十几到几十秒，不给内容就只能干等
+    await on_stage(
+        "enhance",
+        "探针判定：" + ("codegen（WolframContext 认得这个问题）" if mode == "codegen"
+                       else "chat（WolframContext 没有可用返回）"),
+        {"probe": ctx_text},
+    )
     if req.task_id:
         try:
             task = get_task(req.task_id)
@@ -170,6 +198,7 @@ async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
             temperature=req.temperature,
             prior=prior,
             session_id=req.session_id,
+            on_stage=on_stage,
         )
         traj.trace_path = TraceStore().write_trajectory(traj, task)
         return ExecuteResponse(
@@ -190,11 +219,13 @@ async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
         temperature=req.temperature,
         prior=prior,
         session_id=req.session_id,
+        on_stage=on_stage,
     )
     await Judge().score(traj, task)
 
     # ---- Step 4：自然语言总结（一段连贯叙述，图像内联在 [[n]] 处）----
-    result = await _summarize(traj)
+    await on_stage("summary", "把结果写成一段话")
+    result = await _summarize(traj, on_stage)
 
     # ---- Step 5 的写侧：落盘即成为下一轮的记忆来源 ----
     traj.trace_path = TraceStore().write_trajectory(traj, task)
@@ -203,20 +234,69 @@ async def execute_query(req: ExecuteRequest) -> ExecuteResponse:
         query=req.query,
         mode=mode,
         enhanced_query=traj.enhanced_query,
-        wl_code=traj.wl_code,
         exec_ok=traj.exec_ok,
         exec_strategy=traj.exec_strategy,
         result=result,
         utilization=traj.utilization,
-        docs_used=traj.docs_used,
-        doc_queries=[str(h.get("query", "")) for h in traj.doc_hits],
-        alpha_queries=[str(h.get("query", "")) for h in traj.alpha_hits],
         images=traj.images,
         success=traj.success,
         verifiable=task.has_verifier,
         trajectory_id=traj.trajectory_id,
         trace_path=traj.trace_path,
         summary_line=_summary_line(traj),
+    )
+
+
+def _sse(payload: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.post("/execute")
+async def execute_query(req: ExecuteRequest) -> StreamingResponse:
+    """SSE：先若干条 `{stage, label, detail, payload?}` 进度，最后一条 `{stage:"result", data}`。
+
+    payload 是该阶段的可观察产物（探针原文 / 改写出的 WL / Summary 思维链）—— 没有它，
+    整条链路就只有最后那条 result 有内容，分布太不均。
+    """
+    require_llm()
+
+    queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+
+    async def on_stage(name: str, detail: str = "", data: Optional[Dict[str, Any]] = None) -> None:
+        ev: Dict[str, Any] = {
+            "stage": name,
+            "label": STAGE_LABELS.get(name, name),
+            "detail": detail,
+        }
+        if data:
+            ev["payload"] = data
+        await queue.put(ev)
+
+    async def drive() -> Optional[ExecuteResponse]:
+        try:
+            return await _run(req, on_stage)
+        finally:
+            await queue.put({})  # 哨兵：空 dict 为假值
+
+    async def stream() -> AsyncIterator[str]:
+        task = asyncio.create_task(drive())
+        while True:
+            item = await queue.get()
+            if not item:
+                break
+            yield _sse(item)
+        try:
+            resp = await task
+        except Exception as e:
+            # 流水线中途挂了也要让前端看到原因，而不是连接莫名其妙断掉
+            yield _sse({"stage": "error", "label": "Error", "detail": f"{type(e).__name__}: {e}"})
+            return
+        yield _sse({"stage": "result", "data": resp.model_dump()})
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

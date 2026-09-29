@@ -2,6 +2,7 @@
 
     Enhancer._chat()  —— 一次 LLM 采样，返回文本 + 本次调用的计量
     parse_action()    —— 把模型输出解析成动作（提取 WL 表达式）
+    probe()           —— 输入路由：WolframContext 查得到 → codegen，查不到 → chat
     rollout()         —— 驱动 WlEnv 闭环：增强 → 执行 → 拿反馈 → 修正 → ...
     reply()           —— chat 模式：一次调用直接回答，不执行代码
 
@@ -18,9 +19,9 @@ wolfram_alpha（看 W|A 对同一问题给了哪几种表示）。后两个都�
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from backend.core import mcp, rag
+from backend.core import mcp
 from backend.core.asset import CHAT_SUFFIX
 from backend.core.config import settings
 from backend.core.executor import ExecResult, execute
@@ -53,6 +54,27 @@ _TOOL_ARGS: Dict[str, str] = {
 }
 ALLOWED_TOOLS = tuple(_TOOL_ARGS)
 
+#: 阶段名 -> 前端显示的标签。
+STAGE_LABELS: Dict[str, str] = {
+    "nl": "Natural Language",
+    "enhance": "Semantic Enhancement",
+    "wolfram": "Wolfram",
+    "summary": "Summary",
+}
+
+#: 阶段进度回调：(阶段名, 补充说明, 载荷) -> 协程。
+#: 载荷是该阶段的可观察产物（探针原文 / 改写出的 WL / Summary 思维链），没有就传空 dict。
+StageFn = Callable[[str, str, Dict[str, Any]], Awaitable[None]]
+
+
+async def _stage(
+    fn: Optional[StageFn], name: str, detail: str = "", data: Optional[Dict[str, Any]] = None
+) -> None:
+    """上报一个阶段。回调是旁路：没人接就跳过，不影响流水线本身。"""
+    if fn:
+        await fn(name, detail, data or {})
+
+
 #: 载荷是「将要执行的代码」的工具 —— 只有这些要过安全闸门。查询词不是可执行内容，
 #: 扫它会把「Import 怎么用」这类正常检索词误判成越界。
 _CODE_TOOLS = ("execute_wl",)
@@ -84,6 +106,21 @@ def _extract_wl(body: str) -> Optional[str]:
         return m.group(1).strip()
     text = body.strip()
     return text if _looks_like_wl(text) else None
+
+
+#: codegen 协议的标签。chat 的对外回答里不该出现这些痕迹。
+_PROTOCOL_TAG_RE = re.compile(r"</?(?:final|attempt|lookup|alpha|wl)>", re.I)
+
+
+def strip_protocol(text: str) -> str:
+    """剥掉 codegen 协议壳，只留内容。
+
+    CHAT_SUFFIX 压不住长 base_prompt：模型偶尔仍会把回答套进 `<final>```wl … ```</final>`。
+    chat 的回答是对外文本，不该带这种「用过 Wolfram」的痕迹，所以拆壳留内容。
+    """
+    body = _PROTOCOL_TAG_RE.sub("", text or "")
+    body = _WL_FENCE_RE.sub(lambda m: m.group(1).strip(), body)
+    return body.strip()
 
 
 def parse_action(text: str) -> Action:
@@ -142,30 +179,21 @@ def parse_action(text: str) -> Action:
 # ===================== 输入路由 =====================
 
 
-#: 命中任一关键词走 codegen 闭环，否则走通用对话。
-#: 多一次调用 + 一个失败点。到那时再拆成 /execute 与 /chat 由调用方指定。
-CODEGEN_KEYWORDS: Tuple[str, ...] = (
-    # 计算 / 数学
-    "计算", "求解", "解方程", "积分", "微分", "导数", "极限", "级数", "求和",
-    "矩阵", "特征值", "特征向量", "行列式", "方程", "方程组", "优化", "拟合", "回归",
-    "统计", "方差", "概率", "分布", "假设检验", "傅里叶", "变换", "微分方程",
-    # 可视化
-    "画", "绘图", "作图", "图像", "图表", "曲线", "三维", "可视化", "plot",
-    # 数据 / 符号
-    "数据", "分析", "符号", "化简", "展开", "因式分解", "机器学习", "训练模型",
-    # 科学
-    "物理", "化学", "生物", "天文", "地理", "天气", "基因", "量子", "金融",
-    "时间序列", "单位换算", "量纲",
-    # 通用
-    "wolfram", "mathematica", "函数", "怎么用", "如何用", "帮我算", "算一下",
-    "plot", "solve", "integrate", "matrix", "eigen", "fit", "simulate",
-)
+def probe(query: str) -> Tuple[str, str]:
+    """Step 1 的路由：拿 WolframContext 探一次，Wolfram 认得这个问题就走 codegen。
 
+    不由关键词决定 —— 词表得按学科无限扩张，而「认不认得」本来也不是词表擅长的事。
+    判据是 mcp.has_answer；MCP 不可达时判为 chat，因为 codegen 闭环依赖同一个 MCP。
 
-def detect_mode(query: str) -> str:
-    """按关键词决定这一轮走 codegen 闭环还是通用对话。"""
-    text = (query or "").lower()
-    return "codegen" if any(k in text for k in CODEGEN_KEYWORDS) else "chat"
+    这一探要打一次网络，且 WolframContext 会抖动（实测同一条查询第一次回空、第二次
+    才有内容），所以 mcp.context 里留着重试：换学科不用改代码的代价就是这段等待。
+
+    返回 (模式, WolframContext 原文)：原文一并交给调用方，前端要显示出来 —— 这一探
+    几十秒，不给出内容就是个无法解释的省略号。
+    """
+    out = mcp.context((query or "").strip())
+    text = out.text if out else ""
+    return ("codegen" if out and mcp.has_answer(text) else "chat"), text
 
 
 def _meter(traj: Trajectory, meta: Dict[str, int]) -> None:
@@ -403,9 +431,10 @@ class WlEnv:
         """查官方文档。不走 cache：同一个查询词在不同任务里语义相同，但这里没有
         跨轨迹复用点，加了反而要在 judge 里分辨命中的是缓存还是真调用。"""
         t0 = time.perf_counter()
-        text = await asyncio.to_thread(rag.lookup, query)
+        out = await asyncio.to_thread(mcp.context, query)
         rec.exec_latency_ms = elapsed_ms(t0)
         self.doc_queries.append(query)
+        text = (out.text if out else "")[: settings.DOC_CHARS]
         if not text:
             return Observation(
                 content="文档检索没有返回内容（MCP 不可达或查不到该词），请直接按你的理解改写表达式。",
@@ -562,11 +591,13 @@ class Enhancer:
         run_id: str = "",
         prior: Optional[List[Dict[str, str]]] = None,
         session_id: str = "",
+        on_stage: Optional[StageFn] = None,
     ) -> Trajectory:
         """跑完一条完整轨迹：增强 → （查文档 / 查 W|A 参考 / 执行）→ 观测 → 增强 ...
 
         prior 是最近 N 轮会话的对话前缀（指令 3 的指代消解就靠它）。
         文档与 W|A 参考都不由流水线预检索注入，而是 agent 自己用对应工具去取。
+        on_stage 是给前端看的进度上报：每一步采样前报 enhance，每次工具调用前报 wolfram。
         """
         max_steps = max_steps or settings.MAX_STEPS
         temperature = settings.ACT_TEMPERATURE if temperature is None else temperature
@@ -587,6 +618,7 @@ class Enhancer:
 
         while not env.done:
             traj.states.append(State(env_state=env.snapshot(), step=env.step))
+            await _stage(on_stage, "enhance", f"第 {env.step + 1} 步：改写表达式")
             text, meta = await self._chat(
                 [{"role": "system", "content": self.asset.render()}] + history, temperature
             )
@@ -596,6 +628,13 @@ class Enhancer:
             traj.actions.append(action)
             history.append({"role": "assistant", "content": action.content or ""})
 
+            # 改写出的 WL 就地亮出来，别拖到最后才在结果页见到
+            code = str((action.tool_args or {}).get("code") or "")
+            if code:
+                await _stage(on_stage, "enhance", f"第 {env.step + 1} 步：改写结果", {"wl": code})
+
+            if action.type == "tool_call":
+                await _stage(on_stage, "wolfram", action.tool_name or "")
             obs, rec = await env.dispatch(action, meta)
             traj.steps.append(rec)
             traj.rewards.append(0.0)
@@ -610,7 +649,6 @@ class Enhancer:
             traj.enhanced_query = env.resolve_final()
             traj.used_fallback_query = True
 
-        traj.wl_code = traj.enhanced_query
         traj.critical_step = env.best_step
         if 0 <= env.best_step < len(traj.steps):
             traj.steps[env.best_step].credited = True
@@ -624,7 +662,9 @@ class Enhancer:
         traj.alpha_hits = list(env.alpha_hits)
         traj.reference_text = "\n\n".join(env.reference_blocks)
 
-        # 终态：对最终表达式取一次权威判定（没执行过就执行一次，结果同时用于对外展示）
+        # 终态：对最终表达式取一次权威判定。直接给 <final> 时这一步才是真正的 Wolfram
+        # 调用，也是整条链路里最长的一段等待，必须报出来，不能让它藏在 Summary 之前。
+        await _stage(on_stage, "wolfram", "执行最终表达式")
         score, detail, output, ok = await env.verify_final(traj.enhanced_query)
         traj.verify_score, traj.verify_detail = score, detail
         traj.exec_output, traj.exec_ok = output, ok
@@ -653,6 +693,7 @@ class Enhancer:
         temperature: Optional[float] = None,
         prior: Optional[List[Dict[str, str]]] = None,
         session_id: str = "",
+        on_stage: Optional[StageFn] = None,
     ) -> Trajectory:
         """通用对话：一次调用直接回答，不进执行闭环。"""
         temperature = settings.ACT_TEMPERATURE if temperature is None else temperature
@@ -669,12 +710,13 @@ class Enhancer:
         history: List[Dict[str, str]] = list(prior or [])
         history.append({"role": "user", "content": task.prompt})
 
+        await _stage(on_stage, "enhance", "直接作答")
         text, meta = await self._chat(
             [{"role": "system", "content": self.asset.render() + CHAT_SUFFIX}] + history,
             temperature,
         )
         _meter(traj, meta)
-        traj.reply = text.strip()
+        traj.reply = strip_protocol(text)
 
         traj.finished_at = now_iso()
         traj.duration_ms = elapsed_ms(t0)

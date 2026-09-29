@@ -18,6 +18,7 @@
 """
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -113,6 +114,16 @@ def test_parse_action():
     assert junk.type == "think" and junk.parse_failed
 
 
+def test_strip_protocol_removes_codegen_shell_from_chat_reply():
+    """chat 的回答不该带 <final>/```wl 这类「用过 Wolfram」的痕迹 —— 拆壳留内容。"""
+    raw = '好的\n<final>\n```wl\nPlot[Sin[x], {x, -2 Pi, 2 Pi}]\n```\n</final>'
+    got = enhancer_mod.strip_protocol(raw)
+    assert "<final>" not in got and "```" not in got
+    assert got == "好的\n\nPlot[Sin[x], {x, -2 Pi, 2 Pi}]"
+
+    assert enhancer_mod.strip_protocol("就是一段普通的中文回答。") == "就是一段普通的中文回答。"
+
+
 def test_parse_action_lookup():
     """<lookup> 是查文档工具；裸 WL 表达式仍优先当成要执行，不被当成查询词。"""
     look = enhancer_mod.parse_action("<lookup>Eigenvalues 的语法</lookup>")
@@ -138,12 +149,49 @@ def test_parse_action_alpha():
     assert empty.type == "think" and empty.parse_failed, "空查询词不该当成一次工具调用"
 
 
-def test_detect_mode():
-    assert enhancer_mod.detect_mode("画个正弦曲线") == "codegen"
-    assert enhancer_mod.detect_mode("帮我算这个积分") == "codegen"
-    assert enhancer_mod.detect_mode("Plot3D 怎么用") == "codegen"
-    assert enhancer_mod.detect_mode("华东师范大学在哪里") == "chat"
-    assert enhancer_mod.detect_mode("今天心情不错") == "chat"
+def test_probe_routes_by_wolfram_context():
+    """路由不看关键词，只看 WolframContext 有没有可用返回。"""
+    from backend.core import mcp as mcp_mod
+
+    replies = {
+        "画个正弦曲线": mcp_mod.ToolOutput(text="<result query='y = sin(x)'>plot</result>"),
+        # 别的学科也算：Wolfram 认得出来就该走 codegen（这正是关键词表覆盖不到的那类）
+        "法国的首都是哪里": mcp_mod.ToolOutput(text="<result>Paris</result>"),
+        "帮我写一首关于秋天的诗": None,  # 查不到：MCP 回空内容
+        # 回了一段但全是 No Results Found 占位，同样当作没查到
+        "今天心情不错": mcp_mod.ToolOutput(text="No Results Found"),
+    }
+    original = mcp_mod.context
+    mcp_mod.context = lambda q: replies.get(q)  # type: ignore[assignment]
+    try:
+        assert enhancer_mod.probe("画个正弦曲线")[0] == "codegen"
+        assert enhancer_mod.probe("法国的首都是哪里")[0] == "codegen"
+        assert enhancer_mod.probe("帮我写一首关于秋天的诗")[0] == "chat"
+        assert enhancer_mod.probe("今天心情不错")[0] == "chat"
+        # 原文要一并带出来：前端靠它显示探针到底探到了什么
+        assert enhancer_mod.probe("画个正弦曲线")[1].startswith("<result")
+        assert enhancer_mod.probe("帮我写一首关于秋天的诗")[1] == ""
+    finally:
+        mcp_mod.context = original  # type: ignore[assignment]
+
+
+def test_harvest_symbols_learns_from_doc_links():
+    """每次 WolframContext 拿回来的文档链接里的符号名，都要沉淀进 system_names.json。"""
+    from backend.core import mcp as mcp_mod
+
+    path = Path(settings.ASSET_DIR) / "system_names.json"
+    before = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    text = (
+        "see paclet:ref/Eigenvalues and reference.wolfram.com/language/ref/DSolveValue.html"
+        " —— paclet:ref/Eigenvalues 重复出现也不该重复计数"
+    )
+    assert mcp_mod.harvest_symbols(text) == 2
+    after = json.loads(path.read_text(encoding="utf-8"))
+    assert after["Eigenvalues"] is True and after["DSolveValue"] is True
+    assert mcp_mod.harvest_symbols(text) == 0, "已在缓存里的符号不该重复计入"
+    # 只新增不覆盖：先前判为「不是系统符号」的结论不能被文档链接冲掉
+    assert all(after.get(k) == v for k, v in before.items())
 
 
 # ===================== 3. 闭环 rollout =====================
@@ -358,10 +406,12 @@ def test_prompt_render_includes_rules():
 
 def test_lookup_tool_records_docs():
     """agent 用 <lookup> 查官方文档：吃一步预算，命中记进 doc_hits（利用率 docs 信号的依据）。"""
-    from backend.core import rag as rag_mod
+    from backend.core import mcp as mcp_mod
 
-    original = rag_mod.lookup
-    rag_mod.lookup = lambda q: "Eigenvalues[m] 求矩阵特征值"  # type: ignore[assignment]
+    original = mcp_mod.context
+    mcp_mod.context = lambda q: mcp_mod.ToolOutput(  # type: ignore[assignment]
+        text="Eigenvalues[m] 求矩阵特征值"
+    )
     enhancer_mod.execute = _fake_execute_ok()  # type: ignore[assignment]
     try:
         task = TaskSpec(id="t-eig", prompt="特征值", expr_checks=["Eigenvalues"])
@@ -372,7 +422,7 @@ def test_lookup_tool_records_docs():
         enh, calls = _scripted_enhancer(script)
         traj = asyncio.run(enh.rollout(task, max_steps=3))
     finally:
-        rag_mod.lookup = original  # type: ignore[assignment]
+        mcp_mod.context = original  # type: ignore[assignment]
 
     assert calls["n"] == 2, "查文档要吃一步预算"
     assert traj.steps[0].tool_name == "wolfram_context"
@@ -382,11 +432,11 @@ def test_lookup_tool_records_docs():
 
 
 def test_lookup_empty_result_is_not_a_hit():
-    """MCP 不可达 / 查不到词时返回空串：不能算「查过文档」，否则利用率凭空虚高。"""
-    from backend.core import rag as rag_mod
+    """MCP 不可达 / 查不到词时返回空：不能算「查过文档」，否则利用率凭空虚高。"""
+    from backend.core import mcp as mcp_mod
 
-    original = rag_mod.lookup
-    rag_mod.lookup = lambda q: ""  # type: ignore[assignment]
+    original = mcp_mod.context
+    mcp_mod.context = lambda q: None  # type: ignore[assignment]
     enhancer_mod.execute = _fake_execute_ok()  # type: ignore[assignment]
     try:
         task = TaskSpec(id="t-eig", prompt="特征值", expr_checks=["Eigenvalues"])
@@ -394,7 +444,7 @@ def test_lookup_empty_result_is_not_a_hit():
         enh, _ = _scripted_enhancer(script)
         traj = asyncio.run(enh.rollout(task, max_steps=3))
     finally:
-        rag_mod.lookup = original  # type: ignore[assignment]
+        mcp_mod.context = original  # type: ignore[assignment]
 
     assert not traj.docs_used and traj.doc_hits == []
     assert "没有返回内容" in traj.observations[0].content
@@ -443,6 +493,46 @@ def test_audit_excludes_images_and_reference_text():
     assert "x" * 200 not in dumped, "base64 图不能进审计"
     assert "# Pod" not in dumped, "参考资料正文不能进审计"
     assert '"image_count": 1' in dumped, "但张数要留：审计与 rich 信号都看它"
+
+
+def test_execute_streams_stage_events_then_result():
+    """/execute 走 SSE：阶段事件先推完，最后一条 result 带完整结果（前端靠它点亮思维链）。"""
+    from fastapi.testclient import TestClient
+
+    from backend.core.models import ExecuteResponse
+    from backend.main import app
+    from backend.routes import execute as exec_mod
+
+    async def fake_run(req, on_stage):
+        await on_stage("nl", "已收到问题")
+        await on_stage("enhance", "查函数名与语法", {"probe": "<result>Sin</result>"})
+        await on_stage("enhance", "改写结果", {"wl": "Plot[Sin[x], {x, -2 Pi, 2 Pi}]"})
+        await on_stage("wolfram", "execute_wl")
+        await on_stage("summary", "把结果写成一段话")
+        await on_stage("summary", "Summary 思维链", {"reasoning": "先看形状…"})
+        return ExecuteResponse(query=req.query, mode="codegen", result="一段话")
+
+    original = exec_mod._run
+    exec_mod._run = fake_run  # type: ignore[assignment]
+    try:
+        with TestClient(app) as c:
+            resp = c.post("/execute", json={"query": "画个正弦曲线"})
+    finally:
+        exec_mod._run = original  # type: ignore[assignment]
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = [json.loads(l[5:]) for l in resp.text.splitlines() if l.startswith("data:")]
+    assert [e["stage"] for e in events] == [
+        "nl", "enhance", "enhance", "wolfram", "summary", "summary", "result"
+    ]
+    assert events[1]["label"] == "Semantic Enhancement"
+    # 每个阶段都带着自己的可观察产物，别让整条链路只有最后一条 result 有内容
+    assert events[1]["payload"]["probe"] == "<result>Sin</result>"
+    assert events[2]["payload"]["wl"].startswith("Plot[")
+    assert events[5]["payload"]["reasoning"] == "先看形状…"
+    assert "payload" not in events[3], "没有产物的阶段不该凭空带 payload"
+    assert events[-1]["data"]["result"] == "一段话"
 
 
 def test_validate_per_tool_args():

@@ -6,7 +6,7 @@
     π 策略     -> enhancer.py + asset.py
 
 与 agent 的差别只有一处口径：动作产出的是「增强后的 Wolfram 查询」，
-因此 Trajectory 里 final_code 换成 (enhanced_query, wl_code)，验证信号换成第二层执行结果。
+因此 Trajectory 里 final_code 换成 enhanced_query，验证信号换成第二层执行结果。
 """
 
 import uuid
@@ -103,7 +103,6 @@ class Trajectory(BaseModel):
     enhanced_query: str = ""
 
     # ---- 第二层产出 ----
-    wl_code: str = ""
     exec_ok: bool = False
     exec_output: str = ""
     exec_strategy: str = ""        # mcp / blocked / none
@@ -254,14 +253,10 @@ class ExecuteResponse(BaseModel):
     query: str
     mode: str
     enhanced_query: str = ""
-    wl_code: str = ""
     exec_ok: bool = False
     exec_strategy: str = ""
     result: str
     utilization: float = 0.0
-    docs_used: bool = False
-    doc_queries: List[str] = Field(default_factory=list)
-    alpha_queries: List[str] = Field(default_factory=list)
     #: 第二层执行带回的图像（base64 PNG，不含 data: 前缀），由前端内联渲染
     images: List[str] = Field(default_factory=list)
     success: bool = False

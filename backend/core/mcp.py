@@ -45,6 +45,49 @@ _session_id: Optional[str] = None
 _SYMBOL_RE = re.compile(r"\$?[A-Za-z][A-Za-z0-9$]*\Z")
 #: 单次 NameQ 批查的符号个数上限，够小才不会触发服务端输出省略。
 _BATCH = 200
+#: 官方文档里指向某个符号的链接：paclet:ref/Solve、.../language/ref/Solve.html
+_DOC_REF_RE = re.compile(r"(?:paclet:ref/|/language/ref/)([A-Za-z$][A-Za-z0-9$]*)")
+
+
+def _cache_path() -> Path:
+    return Path(settings.ASSET_DIR) / "system_names.json"
+
+
+def _load_cache() -> Dict[str, bool]:
+    try:
+        loaded = json.loads(_cache_path().read_text(encoding="utf-8"))
+        return {k: bool(v) for k, v in loaded.items() if isinstance(k, str)}
+    except Exception:
+        return {}  # 首次运行或缓存损坏，都当空缓存重来
+
+
+def _save_cache(cache: Dict[str, bool]) -> None:
+    try:
+        path = _cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(cache, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+        )
+    except Exception:
+        pass  # 落盘失败只影响下次效率，不影响本次结果
+
+
+def harvest_symbols(text: str) -> int:
+    """从 WolframContext 的返回里学出真实符号名，追加进 assets/system_names.json。
+
+    官方文档只会链接真实存在的符号，等于白捡的权威样本：查得越多，judge 的 functions
+    信号就越少需要打 MCP 现问（一次 NameQ 批查要好几秒）。只新增不覆盖。返回新增数。
+    """
+    names = {n for n in _DOC_REF_RE.findall(text or "") if _SYMBOL_RE.match(n)}
+    if not names:
+        return 0
+    cache = _load_cache()
+    added = sorted(n for n in names if n not in cache)
+    if not added:
+        return 0
+    cache.update(dict.fromkeys(added, True))
+    _save_cache(cache)
+    return len(added)
 
 
 @dataclass
@@ -162,8 +205,28 @@ def evaluate(code: str) -> Optional[ToolOutput]:
 
 
 def context(query: str) -> Optional[ToolOutput]:
-    """对官方参考资料做语义检索（替代原先的爬虫 + 本地 BM25 索引）。"""
-    return call_tool("WolframContext", {"context": query})
+    """对官方参考资料做语义检索。返回里带出的真实符号名顺手学进 system_names.json。
+
+    保留 call_tool 的重试（默认 3 次）：实测同一条查询会「第一次回空、第二次才有内容」，
+    少试一次就会把该走 codegen 的问题误判成 chat。
+    """
+    out = call_tool("WolframContext", {"context": query})
+    if out:
+        harvest_symbols(out.text)
+    return out
+
+
+#: W|A 查不到时写进 `<result>` 里的占位符
+_NO_RESULTS = "No Results Found"
+
+
+def has_answer(text: str) -> bool:
+    """WolframContext 的返回里有没有**可用**内容 —— 也是 Step 1 的路由判据。
+
+    与 Wolfram 无关的问题（写诗、自我介绍）返回空，有关的（含地理、天气）都有内容；
+    唯一的坑是查不到时它仍回一段带 `No Results Found` 占位的文本，所以要剔掉占位符。
+    """
+    return bool((text or "").replace(_NO_RESULTS, "").strip())
 
 
 def alpha(query: str) -> Optional[ToolOutput]:
@@ -189,14 +252,7 @@ def check_symbols(names: Iterable[str]) -> Set[str]:
     改成按需批量问，并把每个符号的结论（含否定结论）落盘缓存 —— 第二轮回落到
     同一批函数时不再打 MCP，缓存文件是 assets/system_names.json。
     """
-    cache_path = Path(settings.ASSET_DIR) / "system_names.json"
-    cache: Dict[str, bool] = {}
-    try:
-        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-        cache = {k: bool(v) for k, v in loaded.items() if isinstance(k, str)}
-    except Exception:
-        cache = {}  # 首次运行或缓存损坏，都当空缓存重来
-
+    cache = _load_cache()
     candidates = sorted({n for n in names if _SYMBOL_RE.match(n)})
     unknown = [n for n in candidates if n not in cache]
     if unknown:
@@ -215,11 +271,5 @@ def check_symbols(names: Iterable[str]) -> Set[str]:
             for n in batch:
                 cache[n] = n in real
 
-    try:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(
-            json.dumps(cache, ensure_ascii=False, sort_keys=True), encoding="utf-8"
-        )
-    except Exception:
-        pass  # 落盘失败只影响下次效率，不影响本次结果
+    _save_cache(cache)
     return {n for n in candidates if cache.get(n)}

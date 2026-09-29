@@ -40,13 +40,23 @@
   .rich figure { margin:12px 0; }
   .rich img { max-width:100%; border-radius:8px; display:block; }
   .rich figcaption { color:var(--dim); font-size:12px; margin-top:6px; }
+  /* 阶段产物（探针原文 / WL / 思维链）可能很长，限高可滚，别把结果顶到屏幕外 */
+  .card pre { max-height:280px; overflow:auto; }
   #status { margin-top:12px; color:var(--dim); font-size:12px; min-height:18px; }
+  /* 页头那条链路就是进度条：走到哪个阶段哪个阶段亮起来，别让用户对着省略号干等 */
+  #chain span { color:var(--dim); font-size:12px; }
+  #chain span.on { color:var(--acc); font-weight:600; }
+  #chain span.done { color:var(--ok); }
 </style>
 </head>
 <body>
 <header>
   <h1>AI4S Agent</h1>
-  <span>Natural Language → Semantic Enhancement → Wolfram → Summary</span>
+  <span id="chain">
+    <span data-s="nl">Natural Language</span> →
+    <span data-s="enhance">Semantic Enhancement</span> →
+    <span data-s="wolfram">Wolfram</span> →
+    <span data-s="summary">Summary</span></span>
   <span id="health"></span>
 </header>
 
@@ -84,7 +94,7 @@ $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') run(); });
 
 fetch('/health').then(r => r.json()).then(h => {
   const w = h.wolfram;
-  $('health').innerHTML = `· 第二层 ${w.available
+  $('health').innerHTML = ` ${w.available
     ? '<span class="ok">Wolfram MCP 可用</span>'
     : '<span class="bad">Wolfram MCP 不可达</span>'} · 模型 ${h.model}`;
 }).catch(() => {});
@@ -101,8 +111,7 @@ function esc(s) {
   return (s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
 
-// ---- 富文本渲染：把「一段连贯叙述」渲染成 HTML，图片内联在 [[n]] 处 ----
-// 只支持三样：``` 围栏代码块、[[n]] 图像占位符、空行分段。够用即可，不引 markdown 库。
+// ---- 富文本渲染：把叙述渲染成 HTML。只支持 ``` 围栏、[[n]] 图像、空行分段，够用即可 ----
 
 function imgFigure(n, b64) {
   return b64
@@ -137,62 +146,96 @@ function paras(text, images) {
     .map(s => `<div class="para">${inlineRich(s, images)}</div>`).join('');
 }
 
+// ---- 阶段进度：页头那条链路是进度条，每段的可观察产物就地摊开 ----
+const CHAIN = ['nl', 'enhance', 'wolfram', 'summary'];
+
+function setStage(name, detail, payload) {
+  const i = CHAIN.indexOf(name);
+  document.querySelectorAll('#chain [data-s]').forEach(el => {
+    const j = CHAIN.indexOf(el.dataset.s);
+    el.className = i < 0 ? '' : j < i ? 'done' : j === i ? 'on' : '';
+  });
+  $('status').textContent = detail || '';
+  if (payload) renderPayload(payload);
+}
+
+function renderPayload(p) {
+  // 探针无条件显示：它的有无正是路由判据，空也要让人看见「为什么走了 chat」
+  if ('probe' in p) {
+    card('探针：WolframContext 返回', p.probe
+      ? `<pre>${esc(p.probe)}</pre>`
+      : '<div class="meta">WolframContext 无可用返回 → 判为 chat，走通用对话</div>');
+  }
+  if (p.wl) card('改写结果：Wolfram Language 表达式', `<pre>${esc(p.wl)}</pre>`);
+  if (p.reasoning) card('Summary 思维链', `<pre>${esc(p.reasoning)}</pre>`);
+}
+
+// ---- SSE：POST 拿不到 EventSource，所以自己读流；只认 `data: {json}` 行 ----
+async function* sse(resp) {
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const p of parts) {
+        const line = p.split('\n').find(l => l.startsWith('data:'));
+        if (line) yield JSON.parse(line.slice(5).trim());
+      }
+    }
+  } finally {
+    // 拿到 result 后生成器提前 return，流没读完 —— 主动 cancel 掉，否则控制台报 ERR_ABORTED
+    reader.cancel().catch(() => {});
+  }
+}
+
+function renderResult(data) {
+  $('status').innerHTML = `<span class="meta">${esc(data.summary_line)}</span>`
+    + (data.trace_path ? ` · <a href="/runs/${data.trajectory_id}" target="_blank">审计轨迹</a>` : '');
+
+  if (data.mode === 'chat') {
+    card('回答（通用对话，未执行代码）', `<pre>${esc(data.result)}</pre>`);
+    return;
+  }
+
+  // 结果卡片只放「执行最终表达式得到的返回值」：叙述 + 内联图。表达式在改写阶段已展示过，
+  // 执行方式、利用率、参考资料都是「用过 Wolfram」的痕迹，不摆这里（审计信息在状态行与轨迹里）。
+  const imgs = data.images || [];
+  // 兜底：模型被 max_tokens 截断时可能漏标某张图，别让图凭空消失 —— 补在段尾。
+  const missing = imgs.map((_, i) => i + 1)
+    .filter(n => !(data.result || '').includes(`[[${n}]]`))
+    .map(n => imgFigure(n, imgs[n - 1])).join('');
+  const main = card('结果', '');
+  main.insertAdjacentHTML('beforeend',
+    `<div class="rich">${renderRich(data.result, imgs)}${missing}</div>`);
+}
+
 async function run() {
   const query = $('q').value.trim();
   if (!query) return;
   $('go').disabled = true;
   $('out').innerHTML = '';
-  $('status').textContent = 'Thinking… (Enhance → Wolfram → Summarize)';
+  setStage('nl', '');
   try {
     const resp = await fetch('/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, session_id: session, max_steps: 3, temperature: 0.7 }),
     });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || resp.statusText);
-
-    $('status').innerHTML = `<span class="meta">${esc(data.summary_line)}</span>`
-      + (data.trace_path ? ` · <a href="/runs/${data.trajectory_id}" target="_blank">审计轨迹</a>` : '');
-
-    if (data.mode === 'chat') {
-      card('回答（通用对话，未执行代码）', `<pre>${esc(data.result)}</pre>`);
-      return;
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText);
     }
-
-    const badge = data.exec_ok
-      ? `<span class="ok">执行成功 · ${data.exec_strategy || '-'}</span>`
-      : `<span class="bad">执行失败 · ${data.exec_strategy || '-'}</span>`;
-
-    const util = data.utilization == null
-      ? ''
-      : ` · 利用率 ${Math.round(data.utilization * 100)}%`;
-
-    // 表达式、总结、图像合成同一张卡片的一段叙述：图按模型给的 [[n]] 占位符内联
-    const imgs = data.images || [];
-    // 兜底两处：模型偶尔漏掉 ```wl 代码块，或被 max_tokens 截断而漏标某张图，
-    // 都别让内容凭空消失 —— 补在段尾，仍在这张卡片里。
-    const missing = imgs.map((_, i) => i + 1)
-      .filter(n => !(data.result || '').includes(`[[${n}]]`))
-      .map(n => imgFigure(n, imgs[n - 1])).join('');
-    const rich = renderRich(data.result, imgs)
-      + (/```/.test(data.result || '') || !data.enhanced_query
-        ? '' : `<pre>${esc(data.enhanced_query)}</pre>`)
-      + missing;
-    const main = card('结果', '');
-    main.insertAdjacentHTML('beforeend',
-      `<div class="meta" style="margin-bottom:10px">${badge}${util}`
-      + `${data.verifiable ? '' : ' · 本次无可验证信号（临时任务）'}</div>`
-      + `<div class="rich">${rich}</div>`);
-
-    const refs = [];
-    if (data.docs_used && data.doc_queries.length) {
-      refs.push(...data.doc_queries.map(q => `<div>官方文档：${esc(q)}</div>`));
+    for await (const ev of sse(resp)) {
+      if (ev.stage === 'result') { setStage('', ''); renderResult(ev.data); return; }
+      if (ev.stage === 'error') throw new Error(ev.detail);
+      setStage(ev.stage, ev.detail, ev.payload);
     }
-    if (data.alpha_queries && data.alpha_queries.length) {
-      refs.push(...data.alpha_queries.map(q => `<div>W|A 视图清单（仅作参考）：${esc(q)}</div>`));
-    }
-    if (refs.length) card('参考资料', refs.join(''));
+    throw new Error('连接提前结束，未收到结果');
   } catch (e) {
     $('status').innerHTML = `<span class="bad">请求失败：${esc(e.message)}</span>`;
   } finally {
